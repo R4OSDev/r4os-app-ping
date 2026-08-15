@@ -1,0 +1,12 @@
+﻿Ping provenance
+===============
+
+Fachliche Quelle:
+- Eingefrorener Altprojekt-Commit: 259cbfac272c47ac1a7828de973512d17b29ae10
+- Urspruenglicher Pfad: Code/System/Software/Ping
+
+Transfer in R4OS 0.64.18:
+- Quellcode, Manifest, Assets und vorhandene Projektdokumentation wurden
+  bytegenau aus dem eingefrorenen Commit uebernommen.
+- Buildstarter, Settings, Paket-Pin und Repositoryhygiene bilden die neue
+  Repositorygrenze; die fachliche Implementierung blieb unveraendert.
