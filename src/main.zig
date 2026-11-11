@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 
 const ICMP_PROTOCOL: u8 = 1;
@@ -12,7 +13,7 @@ const PING_EMPTY_SPINS_BEFORE_SLEEP: u32 = 4;
 const CTRL_C: u8 = 0x03;
 
 const PingOptions = struct {
-    target: [4]u8,
+    target: r4os.abi.NetworkAddress,
     target_name: []const u8,
     resolved_name: bool,
     continuous: bool,
@@ -31,23 +32,27 @@ const PingAttemptResult = enum {
     timeout,
     tx_error,
     aborted,
+    clock_error,
 };
 
 const App = struct {
     sys: r4os.r4sys.Context,
     desk: r4os.r4desk.Context,
     net: r4os.r4net.Context,
+    dev: r4os.r4dev.Context,
+    app: *r4os.App2,
+    clock: r4os.rpc_budget.Clock,
+    sample: ?r4os.time_contract.checked.ClockSample = null,
 
-    fn init(r4_app: *r4os.App) ?App {
+    fn init(r4_app: *r4os.App2) ?App {
         return .{
             .sys = r4_app.system(),
             .desk = r4_app.desktop() orelse return null,
             .net = r4_app.networkLowLevel() orelse return null,
+            .dev = r4_app.devicesLowLevel() orelse return null,
+            .app = r4_app,
+            .clock = (r4_app.clock() catch return null).read,
         };
-    }
-
-    fn argsRaw(self: *const App) [*:0]const u8 {
-        return self.sys.argsRaw();
     }
 
     fn write(self: *const App, value: []const u8) void {
@@ -66,10 +71,6 @@ const App = struct {
         self.sys.printU64(value);
     }
 
-    fn ticks(self: *const App) u64 {
-        return self.sys.ticks();
-    }
-
     fn sleepTicks(self: *const App, duration: u64) void {
         self.sys.sleepTicks(duration);
     }
@@ -78,24 +79,12 @@ const App = struct {
         self.sys.taskYield();
     }
 
-    fn monotonicHz(self: *const App) u32 {
-        return self.sys.monotonicHz();
-    }
-
     fn programShouldClose(self: *const App) bool {
         return self.sys.programShouldClose();
     }
 
     fn readKey(self: *const App) u8 {
         return self.desk.readKey();
-    }
-
-    fn netResolveA(self: *const App, name_value: []const u8, options: r4os.r4net.ResolverOptions, out: *r4os.r4net.ResolverResult) i32 {
-        return self.net.netResolveA(name_value, options, out);
-    }
-
-    fn netDnsResultName(self: *const App, result: i32) []const u8 {
-        return self.net.netDnsResultName(result);
     }
 
     fn netIpv4Send(self: *const App, a: u8, b: u8, c: u8, d: u8, protocol_id: u8, payload: []const u8) i32 {
@@ -111,111 +100,154 @@ const App = struct {
     }
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
-    const ctx = App.init(r4_app) orelse return r4os.abi.err_no_group;
-    const options = parseOptions(&ctx, trim(zSlice(ctx.argsRaw()))) orelse {
-        usage(&ctx);
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
+    var ctx = App.init(r4_app) orelse return r4os.abi.err_no_group;
+    const options = parseOptions(&ctx, r4_app.args()) orelse {
+        ctx.println("Usage: PING [-t] [-4|-6] address|hostname");
+        ctx.println("Link-local IPv6 requires address%numeric-interface.");
         return 1;
     };
-
     if (options.resolved_name) {
         ctx.write("Resolved ");
         ctx.write(options.target_name);
         ctx.write(" to ");
-        writeIpv4(&ctx, options.target);
+        writeAddress(&ctx, options.target);
         ctx.write("\r\n");
     }
-
     ctx.write("Pinging ");
-    writeIpv4(&ctx, options.target);
+    writeAddress(&ctx, options.target);
     ctx.write(" with 16 bytes of data:\r\n");
-
-    var stats = PingStats{};
-    stats.drained += drainIcmpQueue(&ctx);
+    var stats: PingStats = .{};
     var request_buf: [32]u8 = .{0} ** 32;
-    const ident = makeIdent(options.target, ctx.ticks());
+    const start = checkedNow(&ctx) catch {
+        ctx.println("PING clock unavailable");
+        return 1;
+    };
+    const ident = makeIdent(options.target.bytes[0..4].*, start.instant_ns);
+    var ipv6: r4os.network_family.Ipv6 = undefined;
+    var prepared: r4os.abi.Ipv6Packet = .{};
+    if (options.target.family == 6) {
+        var budget = operationBudget(&ctx, PING_TIMEOUT_MS) catch return 1;
+        const rc = selectIpv6(&ctx, options.target, &budget, &ipv6, &prepared);
+        if (rc != 0) {
+            ctx.write("IPv6 route/provider unavailable, code=");
+            ctx.sys.printI32(rc);
+            ctx.write("\r\n");
+            return 1;
+        }
+    } else stats.drained = drainIcmpQueue(&ctx);
     var sequence_counter: u32 = 0;
     var aborted = false;
-
     while (options.continuous or sequence_counter < DEFAULT_COUNT) {
-        sequence_counter += 1;
+        sequence_counter +%= 1;
         const seq = makeSeq(sequence_counter);
-
-        const attempt = pingOnce(&ctx, options.target, ident, seq, request_buf[0..], &stats);
+        const attempt = if (options.target.family == 6)
+            pingIpv6(&ctx, &ipv6, prepared, ident, seq, &stats)
+        else
+            pingOnce(&ctx, options.target.bytes[0..4].*, ident, seq, &request_buf, &stats);
+        if (attempt == .clock_error) {
+            ctx.println("PING clock/budget failure");
+            return 1;
+        }
         if (attempt == .aborted) {
             aborted = true;
             break;
         }
-
         if (!options.continuous and sequence_counter >= DEFAULT_COUNT) break;
-        if (waitOrAbort(&ctx, msToTicks(&ctx, PING_DELAY_MS), options.target, ident, &stats)) {
+        if (waitOrAbort(&ctx, PING_DELAY_MS, options.target, ident, &stats) catch {
+            ctx.println("PING clock/budget failure");
+            return 1;
+        }) {
             aborted = true;
             break;
         }
     }
-
-    if (aborted) {
-        ctx.write("^C\r\n");
-    }
-
+    if (aborted) ctx.write("^C\r\n");
     printStats(&ctx, options.target, stats);
     if (aborted) return 0;
     return if (stats.sent != 0 and stats.received == stats.sent) 0 else 1;
 }
 
-fn usage(ctx: *const App) void {
-    ctx.println("Usage: PING [-t] a.b.c.d|hostname");
-}
-
-fn parseOptions(ctx: *const App, args: []const u8) ?PingOptions {
-    var rest = trim(args);
-    var options = PingOptions{ .target = .{ 0, 0, 0, 0 }, .target_name = "", .resolved_name = false, .continuous = false };
-    var have_target = false;
-
-    while (rest.len != 0) {
-        const split = firstSpace(rest) orelse rest.len;
-        const token = rest[0..split];
-
-        if (equalsIgnoreCase(token, "-t")) {
-            if (options.continuous) return null;
-            options.continuous = true;
+fn parseOptions(ctx: *const App, raw: []const u8) ?PingOptions {
+    var detail: r4os.arguments.Failure = .{};
+    var cursor = r4os.arguments.ArgCursor.init(raw, .{ .switches = r4os.arguments.dash }, &detail) catch return null;
+    var options: PingOptions = .{ .target = .{}, .target_name = "", .resolved_name = false, .continuous = false };
+    var family: u32 = 0;
+    while (cursor.next() catch return null) |token| {
+        const value = token.bytes(raw) catch return null;
+        if (token.switch_prefix != 0) {
+            if (std.ascii.eqlIgnoreCase(value, "-t")) {
+                if (options.continuous) return null;
+                options.continuous = true;
+            } else if (std.ascii.eqlIgnoreCase(value, "-4") or std.ascii.eqlIgnoreCase(value, "-6")) {
+                if (family != 0) return null;
+                family = if (value[1] == '4') 4 else 6;
+            } else return null;
         } else {
-            if (have_target) return null;
-            if (parseIpv4(token)) |ip| {
-                options.target = ip;
-            } else {
-                var resolved: r4os.r4net.ResolverResult = .{};
-                const result = ctx.netResolveA(token, .{}, &resolved);
-                if (result != r4os.abi.dns_result_ok) {
-                    ctx.write("DNS resolve failed for ");
-                    ctx.write(token);
-                    ctx.write(": ");
-                    ctx.write(ctx.netDnsResultName(result));
-                    ctx.write("\r\n");
-                    return null;
-                }
-                options.target = resolved.answer;
-                options.target_name = token;
-                options.resolved_name = true;
-            }
-            have_target = true;
+            if (options.target_name.len != 0 or value.len == 0) return null;
+            options.target_name = value;
         }
-
-        rest = if (split >= rest.len) "" else trim(rest[split..]);
     }
-
-    if (!have_target) return null;
+    if (options.target_name.len == 0) return null;
+    if (r4os.network_family.parseAddress(options.target_name)) |address| {
+        if (family != 0 and family != address.family) return null;
+        options.target = address;
+        return options;
+    }
+    if (std.mem.indexOfScalar(u8, options.target_name, ':') != null or std.mem.indexOfScalar(u8, options.target_name, '%') != null) return null;
+    const clock = ctx.app.clock() catch return null;
+    var budget = r4os.rpc_budget.Budget.fromTimeout(clock.read, .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = 5_000_000_000 }) catch return null;
+    var client: r4os.network_family.Client = undefined;
+    const opened = ctx.app.networkFamily(.dns, &client);
+    if (opened != 0) {
+        ctx.println("DNS service unavailable");
+        return null;
+    }
+    var answers: [32]r4os.abi.NetworkResolveAnswer = undefined;
+    var count: u32 = 0;
+    const rc = r4os.network_family.resolveAll(&client, options.target_name, if (family == 0) 4 else family, .{}, &budget, &answers, &count);
+    const closed = client.close();
+    if (rc != 0 or closed < 0) {
+        ctx.write("DNS resolve failed for ");
+        ctx.write(options.target_name);
+        ctx.write(" code=");
+        ctx.sys.printI32(if (rc != 0) rc else closed);
+        ctx.write("\r\n");
+        return null;
+    }
+    options.target = answers[0].address;
+    if (options.target.family == 6 and r4os.network_family.linkLocal(options.target.bytes) and options.target.scope_id == 0) {
+        ctx.println("DNS link-local address has no interface scope");
+        return null;
+    }
+    options.resolved_name = true;
     return options;
 }
 
+fn checkedNow(ctx: *App) r4os.network_family.common.Error!r4os.time_contract.checked.ClockSample {
+    const now = try r4os.network_family.common.sample(ctx.sys);
+    if (ctx.sample) |before| {
+        if (!std.meta.eql(now.identity, before.identity) or now.instant_ns < before.instant_ns) return error.ClockChanged;
+    }
+    ctx.sample = now;
+    return now;
+}
+
+fn operationBudget(ctx: *App, milliseconds: u64) r4os.rpc_budget.Error!r4os.rpc_budget.Budget {
+    _ = checkedNow(ctx) catch return error.ClockChanged;
+    return r4os.rpc_budget.Budget.fromTimeout(ctx.clock, .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = milliseconds * 1_000_000 });
+}
+
 fn pingOnce(
-    ctx: *const App,
+    ctx: *App,
     target: [4]u8,
     ident: u16,
     seq: u16,
     request_buf: []u8,
     stats: *PingStats,
 ) PingAttemptResult {
+    var budget = operationBudget(ctx, PING_TIMEOUT_MS) catch return .clock_error;
+    const wait_start = (checkedNow(ctx) catch return .clock_error).instant_ns;
     const request = buildEchoRequest(request_buf, ident, seq) orelse {
         ctx.println("build-failed");
         return .tx_error;
@@ -232,11 +264,13 @@ fn pingOnce(
         return .tx_error;
     }
 
-    const wait_ticks = msToTicks(ctx, PING_TIMEOUT_MS);
-    const wait_start = ctx.ticks();
     var reply_buf: [128]u8 = .{0} ** 128;
     var empty_spins: u32 = 0;
-    while (ctx.ticks() - wait_start < wait_ticks) {
+    while (true) {
+        _ = budget.remainingTicks() catch |err| {
+            if (err != error.TimedOut) return .clock_error;
+            break;
+        };
         if (checkAbort(ctx)) return .aborted;
 
         const poll_result = pollForReply(ctx, target, ident, seq, wait_start, reply_buf[0..], stats);
@@ -258,7 +292,7 @@ fn pingOnce(
 }
 
 fn pollForReply(
-    ctx: *const App,
+    ctx: *App,
     target: [4]u8,
     ident: u16,
     current_seq: u16,
@@ -270,7 +304,8 @@ fn pollForReply(
     while (polled < PING_RECV_BUDGET) : (polled += 1) {
         var packet: r4os.abi.NetIpv4Packet = .{};
         const got = ctx.netIpv4Recv(ICMP_PROTOCOL, &packet, reply_buf);
-        if (got <= 0) return null;
+        if (got < 0 or got > reply_buf.len) return .tx_error;
+        if (got == 0) return null;
 
         const reply_len: usize = @intCast(got);
         if (!sameIpv4(packet.source_ip, target)) {
@@ -284,7 +319,8 @@ fn pollForReply(
         };
 
         if (reply_seq == current_seq) {
-            const elapsed_ms = ticksToMs(ctx, ctx.ticks() - wait_start);
+            const now = checkedNow(ctx) catch return .clock_error;
+            const elapsed_ms = (now.instant_ns - wait_start) / 1_000_000;
             stats.received += 1;
             ctx.write("Reply from ");
             writeIpv4(ctx, packet.source_ip);
@@ -310,12 +346,12 @@ fn pollForReply(
     return null;
 }
 
-fn printStats(ctx: *const App, target: [4]u8, stats: PingStats) void {
+fn printStats(ctx: *const App, target: r4os.abi.NetworkAddress, stats: PingStats) void {
     const lost = if (stats.sent > stats.received) stats.sent - stats.received else 0;
-    const loss_pct: u32 = if (stats.sent == 0) 0 else (lost * 100) / stats.sent;
+    const loss_pct: u64 = if (stats.sent == 0) 0 else (@as(u64, lost) * 100) / stats.sent;
 
     ctx.write("\r\nPing statistics for ");
-    writeIpv4(ctx, target);
+    writeAddress(ctx, target);
     ctx.write(":\r\n");
     ctx.write("    Packets: Sent = ");
     ctx.printU64(stats.sent);
@@ -337,56 +373,26 @@ fn printStats(ctx: *const App, target: [4]u8, stats: PingStats) void {
     }
 }
 
-fn waitOrAbort(
-    ctx: *const App,
-    ticks: u64,
-    target: [4]u8,
-    ident: u16,
-    stats: *PingStats,
-) bool {
-    const started = ctx.ticks();
-    var reply_buf: [128]u8 = .{0} ** 128;
-    while (ctx.ticks() - started < ticks) {
+fn waitOrAbort(ctx: *App, milliseconds: u64, target: r4os.abi.NetworkAddress, ident: u16, stats: *PingStats) r4os.rpc_budget.Error!bool {
+    var budget = try operationBudget(ctx, milliseconds);
+    const started = (checkedNow(ctx) catch return error.ClockChanged).instant_ns;
+    var reply_buf: [128]u8 = undefined;
+    while (true) {
+        _ = budget.remainingTicks() catch |err| {
+            if (err == error.TimedOut) return false;
+            return err;
+        };
         if (checkAbort(ctx)) return true;
-        _ = pollForReply(ctx, target, ident, 0, started, reply_buf[0..], stats);
+        if (target.family == 4) {
+            if (pollForReply(ctx, target.bytes[0..4].*, ident, 0, started, &reply_buf, stats) == .clock_error) return error.ClockChanged;
+        }
         ctx.sleepTicks(1);
     }
-    return false;
 }
 
 fn checkAbort(ctx: *const App) bool {
     if (ctx.programShouldClose()) return true;
     return ctx.readKey() == CTRL_C;
-}
-
-fn parseIpv4(value: []const u8) ?[4]u8 {
-    var out: [4]u8 = .{0} ** 4;
-    var part: usize = 0;
-    var accum: u16 = 0;
-    var digits: usize = 0;
-
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        const ch = value[index];
-        if (ch >= '0' and ch <= '9') {
-            accum = accum * 10 + @as(u16, ch - '0');
-            if (accum > 255) return null;
-            digits += 1;
-            if (digits > 3) return null;
-        } else if (ch == '.') {
-            if (digits == 0 or part >= 3) return null;
-            out[part] = @intCast(accum);
-            part += 1;
-            accum = 0;
-            digits = 0;
-        } else {
-            return null;
-        }
-    }
-
-    if (digits == 0 or part != 3) return null;
-    out[part] = @intCast(accum);
-    return out;
 }
 
 fn writeIpv4(ctx: *const App, ip: [4]u8) void {
@@ -426,13 +432,8 @@ fn buildEchoRequest(out: []u8, ident: u16, seq: u16) ?[]const u8 {
     return out[0..len];
 }
 
-fn isEchoReply(data: []const u8, ident: u16, seq: u16) bool {
-    const reply_seq = echoReplySeq(data, ident) orelse return false;
-    return reply_seq == seq;
-}
-
 fn echoReplySeq(data: []const u8, ident: u16) ?u16 {
-    if (data.len < 8) return null;
+    if (data.len != 16 or !std.mem.eql(u8, data[8..], "R4OSPING")) return null;
     if (data[0] != ICMP_ECHO_REPLY or data[1] != 0) return null;
     if (checksum(data) != 0) return null;
     if (readBe16(data, 4) != ident) return null;
@@ -440,14 +441,9 @@ fn echoReplySeq(data: []const u8, ident: u16) ?u16 {
 }
 
 fn checksum(data: []const u8) u16 {
-    var sum: u32 = 0;
-    var index: usize = 0;
-    while (index + 1 < data.len) : (index += 2) {
-        sum += (@as(u32, data[index]) << 8) | data[index + 1];
-    }
-    if (index < data.len) sum += @as(u32, data[index]) << 8;
-    while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
-    return @intCast(~sum & 0xFFFF);
+    var state: r4os.internet_checksum.Checksum16 = .{};
+    state.add(data) catch unreachable;
+    return state.finish() catch unreachable;
 }
 
 fn readBe16(buf: []const u8, offset: usize) u16 {
@@ -481,55 +477,209 @@ fn makeSeq(counter: u32) u16 {
     return if (seq == 0) 1 else seq;
 }
 
-fn msToTicks(ctx: *const App, ms: u64) u64 {
-    const hz_raw = ctx.monotonicHz();
-    const hz: u64 = if (hz_raw == 0) 100 else hz_raw;
-    const ticks = (ms * hz + 999) / 1000;
-    return if (ticks == 0) 1 else ticks;
+fn writeAddress(ctx: *const App, address: r4os.abi.NetworkAddress) void {
+    var buffer: [80]u8 = undefined;
+    ctx.write(r4os.network_family.addressText(&buffer, address) catch "unknown");
 }
 
-fn ticksToMs(ctx: *const App, ticks: u64) u64 {
-    const hz_raw = ctx.monotonicHz();
-    const hz: u64 = if (hz_raw == 0) 100 else hz_raw;
-    return (ticks * 1000 + hz / 2) / hz;
+fn prefixMatches(address: [16]u8, prefix: [16]u8, bits: u32) bool {
+    if (bits > 128) return false;
+    const whole = bits / 8;
+    if (!std.mem.eql(u8, address[0..whole], prefix[0..whole])) return false;
+    const tail: u3 = @intCast(bits % 8);
+    if (tail == 0) return true;
+    const mask: u8 = @as(u8, 0xff) << @as(u3, @intCast(8 - @as(u4, tail)));
+    return address[whole] & mask == prefix[whole] & mask;
 }
 
-fn zSlice(value: [*:0]const u8) []const u8 {
-    var len: usize = 0;
-    while (value[len] != 0) : (len += 1) {}
-    return value[0..len];
-}
-
-fn trim(value: []const u8) []const u8 {
-    var start: usize = 0;
-    var end: usize = value.len;
-    while (start < end and isSpace(value[start])) : (start += 1) {}
-    while (end > start and isSpace(value[end - 1])) : (end -= 1) {}
-    return value[start..end];
-}
-
-fn firstSpace(value: []const u8) ?usize {
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        if (isSpace(value[index])) return index;
+fn selectIpv6(ctx: *App, target: r4os.abi.NetworkAddress, budget: *r4os.rpc_budget.Budget, selected: *r4os.network_family.Ipv6, prepared: *r4os.abi.Ipv6Packet) i32 {
+    const a = r4os.abi;
+    var snapshot: a.NetConfigSnapshot = .{};
+    if (ctx.net.netConfigGet(&snapshot) != a.net_config_ok) return a.network_error_backend;
+    var found = false;
+    var ambiguous = false;
+    var best_bits: u32 = 0;
+    var best_metric: u32 = std.math.maxInt(u32);
+    var failure: i32 = a.network_error_not_found;
+    for (0..snapshot.adapter_count) |index| {
+        _ = budget.remainingTicks() catch |err| return r4os.rpc_budget.code(err);
+        var client: r4os.network_family.Ipv6 = undefined;
+        const opened = r4os.network_family.Ipv6.open(ctx.dev, @intCast(index), &client);
+        if (opened != 0) {
+            failure = opened;
+            continue;
+        }
+        const info = client.info;
+        if (info.capabilities & (a.ipv6_cap_packet | a.ipv6_cap_icmp) != (a.ipv6_cap_packet | a.ipv6_cap_icmp)) {
+            failure = a.network_error_unsupported_policy;
+            continue;
+        }
+        if (target.interface_id != 0 and target.interface_id != info.link.interface_id) continue;
+        for (0..info.route_count) |cursor| {
+            _ = budget.remainingTicks() catch |err| return r4os.rpc_budget.code(err);
+            var route: a.Ipv6RouteInfo = .{};
+            const rc = client.route(@intCast(cursor), &route);
+            if (rc != 0) return rc;
+            if (!prefixMatches(target.bytes, route.prefix.bytes, route.prefix_length)) continue;
+            if (found and (route.prefix_length < best_bits or route.prefix_length == best_bits and route.metric > best_metric)) continue;
+            var request: a.Ipv6Packet = .{
+                .provider = info.link.provider,
+                .generation = info.link.generation,
+                .source = .{ .family = 6, .interface_id = info.link.interface_id },
+                .destination = target,
+                .deadline = r4os.network_family.fromBudget(budget.deadline) catch |err| return r4os.network_family.common.code(err),
+                .next_header = 58,
+            };
+            request.destination.interface_id = info.link.interface_id;
+            var value: a.Ipv6Packet = .{};
+            const ready = client.packet(a.ipv6_op_prepare, &request, &value);
+            if (ready != 0) {
+                failure = ready;
+                continue;
+            }
+            if (found and route.prefix_length == best_bits and route.metric == best_metric) {
+                if (selected.info.link.interface_id != info.link.interface_id) ambiguous = true;
+            } else {
+                selected.* = client;
+                prepared.* = value;
+                found = true;
+                ambiguous = false;
+                best_bits = route.prefix_length;
+                best_metric = route.metric;
+            }
+        }
     }
-    return null;
+    if (ambiguous) return a.network_error_unsupported_scope;
+    return if (found) 0 else failure;
 }
 
-fn equalsIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var index: usize = 0;
-    while (index < a.len) : (index += 1) {
-        if (upperAscii(a[index]) != upperAscii(b[index])) return false;
+fn pingIpv6(ctx: *App, client: *const r4os.network_family.Ipv6, prepared: r4os.abi.Ipv6Packet, ident: u16, seq: u16, stats: *PingStats) PingAttemptResult {
+    const a = r4os.abi;
+    var budget = operationBudget(ctx, PING_TIMEOUT_MS) catch return .clock_error;
+    const started = (checkedNow(ctx) catch return .clock_error).instant_ns;
+    var message: a.Icmpv6Message = .{ .source = prepared.source.bytes, .destination = prepared.destination.bytes, .bytes = 16 };
+    message.payload[0] = 128;
+    writeBe16(&message.payload, 4, ident);
+    writeBe16(&message.payload, 6, seq);
+    @memcpy(message.payload[8..16], "R4OSPING");
+    var sealed: a.Icmpv6Message = .{};
+    const code = r4os.network_family.protocolRecord(ctx.dev, a.Icmpv6Message, a.Icmpv6Message, "net.icmpv6", a.icmpv6_op_seal, &message, &sealed);
+    if (code != 0 or sealed.bytes != 16 or sealed.flags != 0 or !std.mem.eql(u8, &sealed.source, &message.source) or !std.mem.eql(u8, &sealed.destination, &message.destination)) {
+        ctx.println("ICMPv6 provider/seal failed");
+        return .tx_error;
     }
-    return true;
+    var request = prepared;
+    request.bytes = sealed.bytes;
+    @memcpy(request.payload[0..sealed.bytes], sealed.payload[0..sealed.bytes]);
+    stats.sent += 1;
+    var sent = false;
+    while (true) {
+        _ = budget.remainingTicks() catch |err| {
+            if (err != error.TimedOut) return .clock_error;
+            break;
+        };
+        if (checkAbort(ctx)) return .aborted;
+        request.deadline = r4os.network_family.fromBudget(budget.deadline) catch return .clock_error;
+        var response: a.Ipv6Packet = .{};
+        if (!sent) {
+            const rc = client.packet(a.ipv6_op_send, &request, &response);
+            if (rc == 0) sent = true else if (rc != a.network_error_would_block) {
+                ctx.write("IPv6 transmit failed, code=");
+                ctx.sys.printI32(rc);
+                ctx.write("\r\n");
+                return .tx_error;
+            }
+        }
+        if (sent) {
+            const receive: a.Ipv6Packet = .{
+                .provider = request.provider,
+                .generation = request.generation,
+                .source = .{ .family = 6, .interface_id = client.info.link.interface_id },
+                .destination = .{ .family = 6, .interface_id = client.info.link.interface_id },
+                .deadline = request.deadline,
+                .next_header = 58,
+            };
+            for (0..PING_RECV_BUDGET) |_| {
+                _ = budget.remainingTicks() catch |err| return if (err == error.TimedOut) .timeout else .clock_error;
+                const rc = client.packet(a.ipv6_op_receive, &receive, &response);
+                if (rc == a.network_error_would_block) break;
+                if (rc != 0) {
+                    ctx.write("IPv6 receive failed, code=");
+                    ctx.sys.printI32(rc);
+                    ctx.write("\r\n");
+                    return .tx_error;
+                }
+                const data = response.payload[0..response.bytes];
+                if (!std.mem.eql(u8, &response.source.bytes, &request.destination.bytes) or !std.mem.eql(u8, &response.destination.bytes, &request.source.bytes) or data.len != 16 or data[0] != 129 or data[1] != 0 or readBe16(data, 4) != ident or !std.mem.eql(u8, data[8..], "R4OSPING")) {
+                    stats.ignored += 1;
+                    continue;
+                }
+                const actual_seq = readBe16(data, 6);
+                if (actual_seq != seq) {
+                    stats.late += 1;
+                    continue;
+                }
+                const now = checkedNow(ctx) catch return .clock_error;
+                stats.received += 1;
+                ctx.write("Reply from ");
+                writeAddress(ctx, response.source);
+                ctx.write(": bytes=16 time=");
+                ctx.printU64((now.instant_ns - started) / 1_000_000);
+                ctx.write("ms seq=");
+                ctx.printU64(seq);
+                ctx.write("\r\n");
+                return .reply;
+            }
+        }
+        ctx.sleepTicks(1);
+    }
+    ctx.write("Request timed out. seq=");
+    ctx.printU64(seq);
+    ctx.write("\r\n");
+    return .timeout;
 }
 
-fn upperAscii(ch: u8) u8 {
-    if (ch >= 'a' and ch <= 'z') return ch - ('a' - 'A');
-    return ch;
+test "migration ping route prefixes and whole echo identity" {
+    try std.testing.expect(prefixMatches(.{ 0xfd, 0 } ++ [_]u8{0} ** 14, .{ 0xfd, 0 } ++ [_]u8{0} ** 14, 64));
+    try std.testing.expect(!prefixMatches(.{ 0xfd, 0 } ++ [_]u8{0} ** 14, .{ 0xfe, 0 } ++ [_]u8{0} ** 14, 7));
+    try std.testing.expect(prefixMatches([_]u8{0xff} ** 16, [_]u8{0} ** 16, 0));
+    var bytes: [32]u8 = undefined;
+    _ = buildEchoRequest(&bytes, 17, 23).?;
+    bytes[0] = 0;
+    bytes[2] = 0;
+    bytes[3] = 0;
+    writeBe16(&bytes, 2, checksum(bytes[0..16]));
+    try std.testing.expectEqual(@as(?u16, 23), echoReplySeq(bytes[0..16], 17));
+    bytes[15] ^= 1;
+    bytes[2] = 0;
+    bytes[3] = 0;
+    writeBe16(&bytes, 2, checksum(bytes[0..16]));
+    try std.testing.expectEqual(@as(?u16, null), echoReplySeq(bytes[0..16], 17));
 }
 
-fn isSpace(ch: u8) bool {
-    return ch == ' ' or ch == '\t';
+test "migration ping clock regression and generation changes retain the prior observation" {
+    const a = r4os.abi;
+    const Peer = struct {
+        var generation: u32 = 7;
+        var instant: u64 = 1_000_000_000;
+        fn clock(out: *a.MonotonicClockInfo) callconv(.c) i32 {
+            out.* = .{ .flags = a.monotonic_clock_flag_valid, .source = 1, .generation = generation, .instant_ns = instant, .resolution_ns = 1, .event_requested_hz = 1000 };
+            return 1;
+        }
+    };
+    const platform = r4os.platform2;
+    var table: platform.abi.R4XStartR4Sys2 = .{ .monotonic_clock = @intFromPtr(&Peer.clock) };
+    const imports = [_]platform.abi.R4XStartImport{.{ .group_id = 1, .resolved_version = 2, .table = @intFromPtr(&table) }};
+    const raw: platform.abi.R4XStartContext2 = .{ .import_count = imports.len, .imports = @intFromPtr(&imports) };
+    const context = try platform.Context.init(&raw);
+    var ctx: App = .{ .sys = r4os.r4sys.Context.fromProgram(.{ .generation2 = &context }), .desk = undefined, .net = undefined, .dev = undefined, .app = undefined, .clock = Peer.clock };
+    _ = try checkedNow(&ctx);
+    const before = ctx.sample;
+    Peer.instant -= 1;
+    try std.testing.expectError(error.ClockChanged, checkedNow(&ctx));
+    try std.testing.expectEqualDeep(before, ctx.sample);
+    Peer.instant += 1;
+    Peer.generation += 1;
+    try std.testing.expectError(error.ClockChanged, checkedNow(&ctx));
+    try std.testing.expectEqualDeep(before, ctx.sample);
 }

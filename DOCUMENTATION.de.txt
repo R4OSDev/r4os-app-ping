@@ -1,26 +1,44 @@
 ﻿PING.R4X
 ========
 
-PING.R4X sendet ICMP-Echo-Anfragen und nutzt R4NET fuer Namensaufloesung und
-IPv4.
+PING sendet ICMP-Echo ueber die vorhandenen IPv4- und IPv6-Anbieter.
 
-Projektstruktur seit 0.51.19:
-- `build.zig` baut die App als eigenes SDK-Projekt.
-- `build.zig.zon` bindet `r4os_sdk` als Paket.
-- `module.R4MF` beschreibt Artefakt, Zielpfad, Imports und Contract.
+API-Migration0.90.69
+-------------------
 
-Build im jeweiligen Repository:
+Der normale Build verwendet SDK0.64.202, Contract0.64.93 und App2.
+SDK_PROFILE=r4os-zig-generation2 waehlt R4XStart2 und Query2.
+Die geordneten Importe folgen module.R4MF.
 
-    Build.bat       (Windows)
-    ./Build.sh      (Linux)
+    R4SYS:Query2:2
+    R4DESK:Query2:2
+    R4NET:Query2:2
+    R4DEV:Query2:2
 
-Standardziel im Workspace, ueber ARTIFACTS_ROOT in Settings.R4S:
+PING [-t] [-4|-6] adresse|hostname
+Ohne Familienoption verwenden Hostnamen weiterhin A. Ein IPv6-Literal
+waehlt IPv6, -6 waehlt AAAA fuer einen Namen. Linklokale Literale verlangen
+adresse%interface mit einer numerischen Identitaet aus IPCONFIG.
+Alle DNS-Seiten werden vor Auswahl der ersten Antwort validiert.
+Globale IPv6-Routen werden nach Praefixlaenge und Metrik aus dem aktuellen
+Protokollbestand ausgewaehlt. Mehrdeutige gleichwertige Interfaces liefern
+einen Scopefehler. Provider, Linkgeneration und Quelladresse bleiben gebunden.
+Der externe ICMPv6-Owner versiegelt die Pruefsumme. Ein bestaetigtes
+WouldBlock vor dem Senden darf die Nachbaraufloesung im Restbudget fortsetzen.
+Jeder Echo-Versuch und die Pause besitzen ein endliches absolutes Clockbudget.
+Clockwechsel und rueckwaerts laufende Zeit beenden den Aufrufer.
+Antworten muessen Quell-/Zieladresse, ID, Sequenz und den ganzen16-Byte-Inhalt
+erfuellen. Ctrl-C und kooperatives Close bleiben erhalten.
+
+Build im jeweiligen Repository
+-------------------------------
+
+    Build.bat
+    ./Build.sh
+
+Die duennen Hoststarter fuehren gemeinsame PowerShell7-Logik aus.
+Settings.R4S ordnet die lokalen Besitzer zu. build.zig.zon pinnt den
+Standalone-Satz. Das Manifest besitzt Version, Klasse, Ziel und Abhaengigkeiten.
 
     Artifacts/Modules/Ping/PING.R4X
-
-Contract:
-- App-Einstieg: `r4_app_main`; der SDK-Startup stellt R4XStart bereit.
-- App-Klasse: `console`
-- Eingebaute Platform-API-Imports (Query:1): `R4SYS`, `R4DESK`, `R4NET`
-- Zielpfad im Image: `C:\R4OS\SOFTWARE\TERMINAL\PING.R4X`
-
+    C:\R4OS\SOFTWARE\TERMINAL\PING.R4X
