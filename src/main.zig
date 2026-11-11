@@ -33,11 +33,11 @@ const PingAttemptResult = enum {
     tx_error,
     aborted,
     clock_error,
+    input_error,
 };
 
 const App = struct {
     sys: r4os.r4sys.Context,
-    desk: r4os.r4desk.Context,
     net: r4os.r4net.Context,
     dev: r4os.r4dev.Context,
     app: *r4os.App2,
@@ -47,7 +47,6 @@ const App = struct {
     fn init(r4_app: *r4os.App2) ?App {
         return .{
             .sys = r4_app.system(),
-            .desk = r4_app.desktop() orelse return null,
             .net = r4_app.networkLowLevel() orelse return null,
             .dev = r4_app.devicesLowLevel() orelse return null,
             .app = r4_app,
@@ -81,10 +80,6 @@ const App = struct {
 
     fn programShouldClose(self: *const App) bool {
         return self.sys.programShouldClose();
-    }
-
-    fn readKey(self: *const App) u8 {
-        return self.desk.readKey();
     }
 
     fn netIpv4Send(self: *const App, a: u8, b: u8, c: u8, d: u8, protocol_id: u8, payload: []const u8) i32 {
@@ -145,6 +140,10 @@ pub fn r4_app_main(r4_app: *r4os.App2) i32 {
             pingIpv6(&ctx, &ipv6, prepared, ident, seq, &stats)
         else
             pingOnce(&ctx, options.target.bytes[0..4].*, ident, seq, &request_buf, &stats);
+        if (attempt == .input_error) {
+            ctx.println("PING console input unavailable");
+            return 1;
+        }
         if (attempt == .clock_error) {
             ctx.println("PING clock/budget failure");
             return 1;
@@ -154,8 +153,8 @@ pub fn r4_app_main(r4_app: *r4os.App2) i32 {
             break;
         }
         if (!options.continuous and sequence_counter >= DEFAULT_COUNT) break;
-        if (waitOrAbort(&ctx, PING_DELAY_MS, options.target, ident, &stats) catch {
-            ctx.println("PING clock/budget failure");
+        if (waitOrAbort(&ctx, PING_DELAY_MS, options.target, ident, &stats) catch |err| {
+            ctx.println(if (err == error.Input) "PING console input unavailable" else "PING clock/budget failure");
             return 1;
         }) {
             aborted = true;
@@ -271,7 +270,7 @@ fn pingOnce(
             if (err != error.TimedOut) return .clock_error;
             break;
         };
-        if (checkAbort(ctx)) return .aborted;
+        if (checkAbort(ctx) catch return .input_error) return .aborted;
 
         const poll_result = pollForReply(ctx, target, ident, seq, wait_start, reply_buf[0..], stats);
         if (poll_result != null) return poll_result.?;
@@ -373,7 +372,7 @@ fn printStats(ctx: *const App, target: r4os.abi.NetworkAddress, stats: PingStats
     }
 }
 
-fn waitOrAbort(ctx: *App, milliseconds: u64, target: r4os.abi.NetworkAddress, ident: u16, stats: *PingStats) r4os.rpc_budget.Error!bool {
+fn waitOrAbort(ctx: *App, milliseconds: u64, target: r4os.abi.NetworkAddress, ident: u16, stats: *PingStats) (r4os.rpc_budget.Error || error{Input})!bool {
     var budget = try operationBudget(ctx, milliseconds);
     const started = (checkedNow(ctx) catch return error.ClockChanged).instant_ns;
     var reply_buf: [128]u8 = undefined;
@@ -382,7 +381,7 @@ fn waitOrAbort(ctx: *App, milliseconds: u64, target: r4os.abi.NetworkAddress, id
             if (err == error.TimedOut) return false;
             return err;
         };
-        if (checkAbort(ctx)) return true;
+        if (try checkAbort(ctx)) return true;
         if (target.family == 4) {
             if (pollForReply(ctx, target.bytes[0..4].*, ident, 0, started, &reply_buf, stats) == .clock_error) return error.ClockChanged;
         }
@@ -390,9 +389,16 @@ fn waitOrAbort(ctx: *App, milliseconds: u64, target: r4os.abi.NetworkAddress, id
     }
 }
 
-fn checkAbort(ctx: *const App) bool {
+fn checkAbort(ctx: *const App) error{Input}!bool {
     if (ctx.programShouldClose()) return true;
-    return ctx.readKey() == CTRL_C;
+    var events: [16]r4os.abi.ConsoleInputEvent = undefined;
+    const got = ctx.sys.consoleReadEvents(&events);
+    if (got < 0 or got > events.len) return error.Input;
+    for (events[0..@intCast(got)]) |event| {
+        if (event.version != 1 or event.flags != 0) return error.Input;
+        if ((event.kind == r4os.abi.console_input_event_text or event.kind == r4os.abi.console_input_event_utf8_byte) and event.value == CTRL_C) return true;
+    }
+    return false;
 }
 
 fn writeIpv4(ctx: *const App, ip: [4]u8) void {
@@ -578,7 +584,7 @@ fn pingIpv6(ctx: *App, client: *const r4os.network_family.Ipv6, prepared: r4os.a
             if (err != error.TimedOut) return .clock_error;
             break;
         };
-        if (checkAbort(ctx)) return .aborted;
+        if (checkAbort(ctx) catch return .input_error) return .aborted;
         request.deadline = r4os.network_family.fromBudget(budget.deadline) catch return .clock_error;
         var response: a.Ipv6Packet = .{};
         if (!sent) {
@@ -672,7 +678,7 @@ test "migration ping clock regression and generation changes retain the prior ob
     const imports = [_]platform.abi.R4XStartImport{.{ .group_id = 1, .resolved_version = 2, .table = @intFromPtr(&table) }};
     const raw: platform.abi.R4XStartContext2 = .{ .import_count = imports.len, .imports = @intFromPtr(&imports) };
     const context = try platform.Context.init(&raw);
-    var ctx: App = .{ .sys = r4os.r4sys.Context.fromProgram(.{ .generation2 = &context }), .desk = undefined, .net = undefined, .dev = undefined, .app = undefined, .clock = Peer.clock };
+    var ctx: App = .{ .sys = r4os.r4sys.Context.fromProgram(.{ .generation2 = &context }), .net = undefined, .dev = undefined, .app = undefined, .clock = Peer.clock };
     _ = try checkedNow(&ctx);
     const before = ctx.sample;
     Peer.instant -= 1;
@@ -682,4 +688,39 @@ test "migration ping clock regression and generation changes retain the prior ob
     Peer.generation += 1;
     try std.testing.expectError(error.ClockChanged, checkedNow(&ctx));
     try std.testing.expectEqualDeep(before, ctx.sample);
+}
+
+test "migration ping consumes typed Ctrl-C and explicit bytes from its own console" {
+    const a = r4os.abi;
+    const Peer = struct {
+        var mode: u8 = 0;
+        fn closing(_: *const r4os.platform2.abi.R4XStartContext2) callconv(.c) u32 {
+            return 0;
+        }
+        fn read(out: [*]a.ConsoleInputEvent, capacity: u32) callconv(.c) i32 {
+            if (mode == 3) return -1;
+            if (capacity == 0) return -1;
+            out[0] = .{ .kind = if (mode == 1) a.console_input_event_utf8_byte else a.console_input_event_text, .value = if (mode == 2) 'x' else CTRL_C };
+            return 1;
+        }
+    };
+    const platform = r4os.platform2;
+    var table: platform.abi.R4XStartR4Sys2 = .{};
+    var desk: platform.abi.R4XStartR4Desk2 = .{ .console_read_events = @intFromPtr(&Peer.read) };
+    const imports = [_]platform.abi.R4XStartImport{
+        .{ .group_id = 1, .resolved_version = 2, .table = @intFromPtr(&table) },
+        .{ .group_id = 2, .resolved_version = 2, .table = @intFromPtr(&desk) },
+    };
+    const callback: platform.abi.R4XStartShouldCloseFn2 = Peer.closing;
+    const raw: platform.abi.R4XStartContext2 = .{ .import_count = imports.len, .imports = @intFromPtr(&imports), .flags = a.r4xstart_flag_close_supported, .should_close = @intFromPtr(callback) };
+    const context = try platform.Context.init(&raw);
+    const ctx: App = .{ .sys = r4os.r4sys.Context.fromProgram(.{ .generation2 = &context }), .net = undefined, .dev = undefined, .app = undefined, .clock = null };
+    Peer.mode = 0;
+    try std.testing.expect(try checkAbort(&ctx));
+    Peer.mode = 1;
+    try std.testing.expect(try checkAbort(&ctx));
+    Peer.mode = 2;
+    try std.testing.expect(!try checkAbort(&ctx));
+    Peer.mode = 3;
+    try std.testing.expectError(error.Input, checkAbort(&ctx));
 }

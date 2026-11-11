@@ -52,3 +52,6 @@ explicitly. Provider/link generation and chosen source remain bound. The
 external ICMPv6 codec owns pseudoheader checksum sealing. Each attempt and
 delay uses a checked finite absolute budget. Replies match addresses, ID,
 sequence and all16 payload bytes. Clock changes/regression end the caller.
+
+Typed per-process console events handle Ctrl-C. Explicit UTF8 byte events
+retain the same control-byte meaning. Input transport errors return failure.

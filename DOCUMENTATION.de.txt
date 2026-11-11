@@ -28,7 +28,9 @@ WouldBlock vor dem Senden darf die Nachbaraufloesung im Restbudget fortsetzen.
 Jeder Echo-Versuch und die Pause besitzen ein endliches absolutes Clockbudget.
 Clockwechsel und rueckwaerts laufende Zeit beenden den Aufrufer.
 Antworten muessen Quell-/Zieladresse, ID, Sequenz und den ganzen16-Byte-Inhalt
-erfuellen. Ctrl-C und kooperatives Close bleiben erhalten.
+erfuellen. Ctrl-C wird aus den typisierten Konsolenereignissen des eigenen Prozesses
+beziehungsweise expliziten UTF8-Streambytes gelesen. Fehler beim Lesen
+beenden PING mit Fehlerstatus. Kooperatives Close bleibt erhalten.
 
 Build im jeweiligen Repository
 -------------------------------
